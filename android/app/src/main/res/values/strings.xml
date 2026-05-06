@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">GoChat</string>
+    <string name="title_activity_main">GoChat</string>
+    <string name="package_name">dev.anticode.gochat</string>
+    <string name="custom_url_scheme">dev.anticode.gochat</string>
+</resources>

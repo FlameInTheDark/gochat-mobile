@@ -1,0 +1,2434 @@
+import { useState, useEffect, useMemo, useCallback, useRef, type ChangeEvent, type MouseEvent } from 'react'
+import { motion, AnimatePresence } from 'motion/react'
+import { useParams, useOutletContext, useNavigate, useLocation } from 'react-router-dom'
+import { useQuery, useQueries, useQueryClient } from '@tanstack/react-query'
+import { Hash, Spool, Volume2, VolumeX, Mic, MicOff, Headphones, HeadphoneOff, PhoneOff, Video, VideoOff, Users, ChevronLeft, Search, X, Monitor, Loader2, RotateCcw } from 'lucide-react'
+import axios from 'axios'
+import { Separator } from '@/components/ui/separator'
+import { guildApi, messageApi, rolesApi, searchApi } from '@/api/client'
+import { SearchMessageSearchRequestHasEnum } from '@/client'
+import { useVoiceStore } from '@/stores/voiceStore'
+import { useStreamStore, type StreamConnectionState } from '@/stores/streamStore'
+import { ChannelType } from '@/types'
+import type { DtoChannel, DtoGuild, DtoMessage } from '@/types'
+import type { ServerOutletContext } from './ServerLayout'
+import type { MentionResolver } from '@/lib/messageParser'
+import MessageList from '@/components/chat/MessageList'
+import ChatAttachmentDropZone from '@/components/chat/ChatAttachmentDropZone'
+import MessageInput, { type MessageInputHandle } from '@/components/chat/MessageInput'
+import MemberList from '@/components/layout/MemberList'
+import SearchBar, { type SearchBarHandle, type AppliedFilter } from '@/components/chat/SearchBar'
+import SearchPanel from '@/components/chat/SearchPanel'
+import ThreadCreatePanel from '@/components/chat/ThreadCreatePanel'
+import ThreadListPanel from '@/components/chat/ThreadListPanel'
+import ThreadPanel from '@/components/chat/ThreadPanel'
+import { activateChannel, deactivateChannel } from '@/services/wsService'
+import { joinVoice, leaveVoice, setMuted, setDeafened, enableCamera, disableCamera } from '@/services/voiceService'
+import {
+  STREAM_DEBUG_OVERLAY_EVENT,
+  getStreamDebugStats,
+  isStreamDebugOverlayEnabled,
+  reconnectStream,
+  startScreenShare,
+  stopWatchingStream,
+  stopScreenShare,
+  syncChannelStreams,
+  watchStream,
+  type StreamDebugStats,
+} from '@/services/streamService'
+import type { StreamAudioMode, StreamQualitySettings, StreamSourceType, VoiceStreamSummary } from '@/services/streamApi'
+import { toast } from 'sonner'
+import { useUiStore } from '@/stores/uiStore'
+import { useAuthStore } from '@/stores/authStore'
+import { useMessageStore } from '@/stores/messageStore'
+import { useMentionStore } from '@/stores/mentionStore'
+import { useReadStateStore } from '@/stores/readStateStore'
+import { useUnreadStore } from '@/stores/unreadStore'
+import TypingIndicator from '@/components/chat/TypingIndicator'
+import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { cn } from '@/lib/utils'
+import { useMessagePagination } from '@/hooks/useMessagePagination'
+import { useTranslation } from 'react-i18next'
+import { calculateEffectivePermissions, hasPermission, PermissionBits } from '@/lib/permissions'
+import { getTopRoleColor } from '@/lib/memberColors'
+import { createJumpRequest, type JumpBehavior, type JumpRequest } from '@/lib/messageJump'
+import { isAutoThreadFollowup, isThreadChannel, sortThreadsByActivity } from '@/lib/threads'
+import { buildMessagePreviewText } from '@/lib/messagePreview'
+import { useClientMode } from '@/hooks/useClientMode'
+import StartStreamDialog from '@/components/voice/StartStreamDialog'
+
+type RightPanelMode = 'members' | 'none' | 'threads' | 'thread' | 'thread-create'
+type NonThreadRightPanelMode = Exclude<RightPanelMode, 'threads' | 'thread' | 'thread-create'>
+type RightPanelWidthKey = 'search' | 'members' | 'threads' | 'thread' | 'threadCreate'
+
+interface ChannelPageLocationState {
+  jumpToMessageId?: string
+  jumpBehavior?: JumpBehavior
+  jumpToMessagePosition?: number
+  openThreadId?: string
+  threadJumpToMessageId?: string
+  threadJumpBehavior?: JumpBehavior
+  threadJumpToMessagePosition?: number
+}
+
+interface MissingThreadLookupResult {
+  thread: DtoChannel | null
+  missing: boolean
+}
+
+const EMPTY_MESSAGES: DtoMessage[] = []
+const EMPTY_STREAMS: readonly import('@/services/streamApi').VoiceStreamSummary[] = []
+const THREAD_PREVIEW_FETCH_LIMIT = 20
+const RIGHT_PANEL_WIDTH_STORAGE_KEY = 'channel-page.right-panel-widths'
+const RIGHT_PANEL_WIDTH_KEYS: RightPanelWidthKey[] = [
+  'search',
+  'members',
+  'threads',
+  'thread',
+  'threadCreate',
+]
+const DEFAULT_RIGHT_PANEL_WIDTHS: Record<RightPanelWidthKey, number> = {
+  search: 320,
+  members: 240,
+  threads: 352,
+  thread: 416,
+  threadCreate: 352,
+}
+
+function getRightPanelMaxWidth(containerWidth?: number): number {
+  const base = containerWidth ?? (typeof window !== 'undefined' ? window.innerWidth : 1280)
+  return Math.max(260, Math.floor(base * 0.75))
+}
+
+function getRightPanelMinWidth(containerWidth?: number): number {
+  const base = containerWidth ?? (typeof window !== 'undefined' ? window.innerWidth : 1280)
+  return Math.floor(base * 0.25)
+}
+
+function clampRightPanelWidth(width: number, containerWidth?: number): number {
+  return Math.min(Math.max(Math.round(width), getRightPanelMinWidth(containerWidth)), getRightPanelMaxWidth(containerWidth))
+}
+
+function loadRightPanelWidths(): Record<RightPanelWidthKey, number> {
+  const defaults = { ...DEFAULT_RIGHT_PANEL_WIDTHS }
+  if (typeof window === 'undefined') return defaults
+
+  try {
+    const raw = window.localStorage.getItem(RIGHT_PANEL_WIDTH_STORAGE_KEY)
+    if (!raw) return defaults
+
+    const parsed = JSON.parse(raw) as Partial<Record<RightPanelWidthKey, number>>
+    return {
+      search: clampRightPanelWidth(parsed.search ?? defaults.search),
+      members: clampRightPanelWidth(parsed.members ?? defaults.members),
+      threads: clampRightPanelWidth(parsed.threads ?? defaults.threads),
+      // thread/threadCreate always open at their default width — not restored from storage
+      thread: defaults.thread,
+      threadCreate: defaults.threadCreate,
+    }
+  } catch {
+    return defaults
+  }
+}
+
+function getRightPanelWidthKey(
+  hasSearched: boolean,
+  mode: RightPanelMode,
+): RightPanelWidthKey {
+  if (hasSearched) return 'search'
+  if (mode === 'thread') return 'thread'
+  if (mode === 'threads') return 'threads'
+  if (mode === 'thread-create') return 'threadCreate'
+  return 'members'
+}
+
+function isThreadRightPanelMode(mode: RightPanelMode): boolean {
+  return mode === 'threads' || mode === 'thread' || mode === 'thread-create'
+}
+
+function toNonThreadRightPanelMode(mode: RightPanelMode): NonThreadRightPanelMode {
+  return mode === 'members' ? 'members' : 'none'
+}
+
+function buildThreadPreviewText(
+  message: DtoMessage | null | undefined,
+  t: ReturnType<typeof useTranslation>['t'],
+): string {
+  return buildMessagePreviewText(message, {
+    emptyText: t('threads.previewEmpty'),
+    embedsText: t('threads.previewEmbeds'),
+    attachmentsText: (count) => t('threads.previewAttachments', { count }),
+  })
+}
+
+function isThreadLookupNotFound(error: unknown): boolean {
+  return axios.isAxiosError(error) && error.response?.status === 404
+}
+
+export default function ChannelPage() {
+  const { channelId, serverId } = useParams<{ channelId: string; serverId: string }>()
+  const { channels } = useOutletContext<ServerOutletContext>()
+  const channel = channels.find((c) => String(c.id) === channelId)
+  const isVoice = channel?.type === ChannelType.ChannelTypeGuildVoice
+  const isTextChannel = channel?.type === ChannelType.ChannelTypeGuild
+
+  const navigate = useNavigate()
+  const location = useLocation()
+  const queryClient = useQueryClient()
+  const { t } = useTranslation()
+  const isMobile = useClientMode() === 'mobile'
+
+  useEffect(() => {
+    if (channel?.name) {
+      document.title = `#${channel.name} — GoChat`
+    }
+    return () => { document.title = 'GoChat' }
+  }, [channel?.name])
+
+  const [rightPanelMode, setRightPanelMode] = useState<RightPanelMode>(() => isMobile ? 'none' : 'members')
+  const [rightPanelModeBeforeThreads, setRightPanelModeBeforeThreads] =
+    useState<NonThreadRightPanelMode>('members')
+  const [activeThreadId, setActiveThreadId] = useState<string | null>(null)
+  const [threadJumpRequest, setThreadJumpRequest] = useState<JumpRequest | null>(null)
+  const [createThreadSource, setCreateThreadSource] = useState<DtoMessage | null>(null)
+  const [replyTarget, setReplyTarget] = useState<DtoMessage | null>(null)
+  const [rightPanelWidths, setRightPanelWidths] = useState<Record<RightPanelWidthKey, number>>(
+    () => loadRightPanelWidths(),
+  )
+
+  // ── Search state ────────────────────────────────────────────────────────────
+  const [searchResults, setSearchResults] = useState<DtoMessage[]>([])
+  const [searchTotalPages, setSearchTotalPages] = useState(0)
+  const [searchPage, setSearchPage] = useState(0)
+  const [isSearching, setIsSearching] = useState(false)
+  const [hasSearched, setHasSearched] = useState(false)
+  const [mobileSearchOpen, setMobileSearchOpen] = useState(false)
+  const lastSearchParamsRef = useRef<{ chips: AppliedFilter[]; text: string } | null>(null)
+  const searchBarRef = useRef<SearchBarHandle>(null)
+  const messageInputRef = useRef<MessageInputHandle | null>(null)
+  const rightPanelResizeCleanupRef = useRef<(() => void) | null>(null)
+  const contentContainerRef = useRef<HTMLDivElement>(null)
+
+  // Insert mention from invalid invite embed
+  useEffect(() => {
+    function handleInsertMention(e: Event) {
+      const { userId, name } = (e as CustomEvent<{ userId: string; name: string }>).detail
+      messageInputRef.current?.insertMentionAtEnd(userId, name)
+    }
+    window.addEventListener('chat:insert-mention', handleInsertMention)
+    return () => window.removeEventListener('chat:insert-mention', handleInsertMention)
+  }, [])
+
+  // Jump-to-message from search.
+  const locationState = location.state as ChannelPageLocationState | null
+  const jumpIdFromState = locationState?.jumpToMessageId
+  const jumpBehaviorFromState = locationState?.jumpBehavior ?? 'direct-scroll'
+  const jumpPositionFromState = locationState?.jumpToMessagePosition ?? null
+  const openThreadIdFromState = locationState?.openThreadId
+  const threadJumpIdFromState = locationState?.threadJumpToMessageId
+  const threadJumpBehaviorFromState = locationState?.threadJumpBehavior ?? 'direct-scroll'
+  const threadJumpPositionFromState = locationState?.threadJumpToMessagePosition ?? null
+
+  const [jumpRequest, setJumpRequest] = useState<JumpRequest | null>(null)
+
+  // Derive the jump request from location state synchronously (useMemo runs during render,
+  // before any effects). This ensures useMessagePagination sees the jump on the same render
+  // that channelId changes, preventing a spurious loadInitialWindow call.
+  const locationStateJump = useMemo(
+    () => jumpIdFromState
+      ? createJumpRequest(jumpIdFromState, {
+          behavior: jumpBehaviorFromState,
+          positionHint: jumpPositionFromState,
+        })
+      : null,
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [jumpIdFromState], // stable while location state is unchanged; behavior/position change together
+  )
+
+  // The effective jump request: location state takes priority (cross-channel nav),
+  // falling back to the state-based request (same-channel jumps via setJumpRequest).
+  const effectiveJumpRequest = locationStateJump ?? jumpRequest
+
+  useEffect(() => {
+    if (!jumpIdFromState && !openThreadIdFromState && !threadJumpIdFromState) return
+    // Copy the location-state jump into jumpRequest state so effectiveJumpRequest stays
+    // non-null after location state is cleared (happens below via navigate).
+    if (jumpIdFromState && locationStateJump) {
+      setJumpRequest(locationStateJump)
+    }
+    if (openThreadIdFromState) {
+      setRightPanelModeBeforeThreads((current) => (
+        isThreadRightPanelMode(rightPanelMode) ? current : toNonThreadRightPanelMode(rightPanelMode)
+      ))
+      setActiveThreadId(openThreadIdFromState)
+      setRightPanelMode('thread')
+    }
+    if (threadJumpIdFromState) {
+      setThreadJumpRequest(
+        createJumpRequest(threadJumpIdFromState, {
+          behavior: threadJumpBehaviorFromState,
+          positionHint: threadJumpPositionFromState,
+        }),
+      )
+    }
+    navigate(location.pathname, { replace: true, state: {} })
+  }, [
+    jumpIdFromState,
+    locationStateJump,
+    navigate,
+    location.pathname,
+    openThreadIdFromState,
+    rightPanelMode,
+    threadJumpBehaviorFromState,
+    threadJumpIdFromState,
+    threadJumpPositionFromState,
+  ])
+
+  const handleChannelJumpHandled = useCallback((requestKey: string) => {
+    setJumpRequest((current) => current?.requestKey === requestKey ? null : current)
+  }, [])
+
+  const handleThreadJumpHandled = useCallback((requestKey: string) => {
+    setThreadJumpRequest((current) => current?.requestKey === requestKey ? null : current)
+  }, [])
+
+  const {
+    rows,
+    mode,
+    jumpTargetRowKey,
+    focusTargetRowKey,
+    isLoadingInitial,
+    loadGap,
+    jumpToPresent,
+    ackLatest,
+  } = useMessagePagination(
+    isVoice ? undefined : channelId,
+    effectiveJumpRequest,
+    channel?.last_message_id != null ? String(channel.last_message_id) : undefined,
+  )
+
+  const voiceChannelId = useVoiceStore((s) => s.channelId)
+  const voiceConnectionState = useVoiceStore((s) => s.connectionState)
+  const voicePeers = useVoiceStore((s) => s.peers)
+  const localMuted = useVoiceStore((s) => s.localMuted)
+  const localDeafened = useVoiceStore((s) => s.localDeafened)
+  const localSpeaking = useVoiceStore((s) => s.localSpeaking)
+  const localCameraEnabled = useVoiceStore((s) => s.localCameraEnabled)
+  const localVideoStream = useVoiceStore((s) => s.localVideoStream)
+  const publishing = useStreamStore((s) => s.publishing)
+  const channelStreams = useStreamStore((s) => channelId ? (s.channelStreams[channelId] ?? EMPTY_STREAMS) : EMPTY_STREAMS)
+  const watchedStreams = useStreamStore((s) => s.watched)
+  const isStreamingHere = publishing?.channelId === channelId
+  const displayMediaSupported =
+    typeof navigator !== 'undefined' &&
+    typeof navigator.mediaDevices?.getDisplayMedia === 'function'
+
+  const [spotlightId, setSpotlightId] = useState<string | null>(null)
+  const [streamDialogOpen, setStreamDialogOpen] = useState(false)
+  const [isStartingStream, setIsStartingStream] = useState(false)
+  // Reset spotlight when navigating away from a channel
+  useEffect(() => { setSpotlightId(null) }, [channelId])
+  useEffect(() => {
+    if (!isVoice || voiceChannelId !== channelId) {
+      setStreamDialogOpen(false)
+    }
+  }, [channelId, isVoice, voiceChannelId])
+
+  const currentUser = useAuthStore((s) => s.user)
+  const guild = queryClient.getQueryData<DtoGuild[]>(['guilds'])?.find(
+    (g) => String(g.id) === serverId,
+  )
+
+  const { data: guildDetail } = useQuery({
+    queryKey: ['guild', serverId],
+    queryFn: () => guildApi.guildGuildIdGet({ guildId: serverId! }).then((r) => r.data),
+    enabled: !!serverId,
+    staleTime: 30_000,
+  })
+  const { data: members } = useQuery({
+    queryKey: ['members', serverId],
+    queryFn: () =>
+      guildApi.guildGuildIdMembersGet({ guildId: serverId! }).then((r) => r.data ?? []),
+    enabled: !!serverId,
+    staleTime: 30_000,
+  })
+  const { data: roles } = useQuery({
+    queryKey: ['roles', serverId],
+    queryFn: () =>
+      rolesApi.guildGuildIdRolesGet({ guildId: serverId! }).then((r) => r.data ?? []),
+    enabled: !!serverId,
+    staleTime: 60_000,
+  })
+
+  const currentMember = members?.find((m) => String(m.user?.id) === String(currentUser?.id))
+  const isOwner = guild?.owner != null && currentUser?.id !== undefined && String(guild.owner) === String(currentUser.id)
+  const guildPermissions = guildDetail?.permissions ?? 0
+  const effectivePermissions = currentMember && roles
+    ? calculateEffectivePermissions(currentMember, roles, guildPermissions)
+    : guildPermissions
+  const isAdmin = hasPermission(effectivePermissions, PermissionBits.ADMINISTRATOR)
+  const memberRoleIds = new Set((currentMember?.roles ?? []).map(String))
+  const canAccessParentChannel = isOwner || isAdmin || !channel?.private ||
+    (channel?.roles ?? []).some((r) => memberRoleIds.has(String(r)))
+  const canCreateThreads = canAccessParentChannel && (isOwner || isAdmin || hasPermission(effectivePermissions, PermissionBits.CREATE_THREADS))
+  const canSendInThreads = canAccessParentChannel && (isOwner || isAdmin || hasPermission(effectivePermissions, PermissionBits.SEND_MESSAGES_IN_THREADS))
+  const canManageThreads = isOwner || isAdmin || hasPermission(effectivePermissions, PermissionBits.MANAGE_THREADS)
+
+  async function handleStartChannelStream(
+    sourceType: StreamSourceType,
+    audioMode: StreamAudioMode,
+    quality: StreamQualitySettings,
+  ) {
+    if (!serverId || !channelId) return
+    setIsStartingStream(true)
+    try {
+      await startScreenShare(serverId, channelId, sourceType, audioMode, quality)
+      setStreamDialogOpen(false)
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : t('common.error'))
+    } finally {
+      setIsStartingStream(false)
+    }
+  }
+
+  async function handleToggleChannelStream() {
+    if (isStreamingHere) {
+      await stopScreenShare()
+      return
+    }
+    setStreamDialogOpen(true)
+  }
+
+  const { data: threadListData = [], isLoading: isThreadsLoading } = useQuery({
+    queryKey: ['channel-threads', serverId, channelId],
+    queryFn: () =>
+      guildApi.guildGuildIdChannelChannelIdThreadsGet({
+        guildId: serverId!,
+        channelId: channelId!,
+      }).then((res) => res.data ?? []),
+    enabled: !!serverId && !!channelId && isTextChannel,
+    staleTime: 30_000,
+  })
+
+  const channelThreads = useMemo(
+    () => sortThreadsByActivity(threadListData),
+    [threadListData],
+  )
+
+  const activeThreadFromList = channelThreads.find((thread) => String(thread.id) === activeThreadId)
+  const { data: directThreadChannel, isLoading: isActiveThreadLoading } = useQuery({
+    queryKey: ['thread-channel', serverId, activeThreadId],
+    queryFn: () =>
+      guildApi.guildGuildIdChannelChannelIdGet({
+        guildId: serverId!,
+        channelId: activeThreadId!,
+      }).then((res) => res.data),
+    enabled: !!serverId && !!activeThreadId && !activeThreadFromList,
+    staleTime: 30_000,
+  })
+
+  const activeThread = activeThreadFromList ?? (
+    isThreadChannel(directThreadChannel) ? directThreadChannel : null
+  )
+
+  const channelMessages = useMessageStore((s) =>
+    channelId ? (s.messages[channelId] ?? EMPTY_MESSAGES) : EMPTY_MESSAGES,
+  )
+  const threadMessages = useMessageStore((s) => s.messages)
+
+  const knownThreadById = useMemo(() => {
+    const map = new Map<string, DtoChannel>()
+    const addThread = (thread: DtoChannel | null | undefined) => {
+      if (!isThreadChannel(thread) || thread.id == null) return
+      map.set(String(thread.id), thread)
+    }
+
+    channelThreads.forEach(addThread)
+    addThread(activeThread)
+    channels.forEach(addThread)
+    channelMessages.forEach((message) => addThread(message.thread))
+
+    return map
+  }, [activeThread, channelMessages, channelThreads, channels])
+
+  const missingThreadLookupTargets = useMemo(() => {
+    const ordered: string[] = []
+    const seen = new Set<string>()
+
+    channelMessages.forEach((message) => {
+      const attachedThread = isThreadChannel(message.thread) ? message.thread : null
+      const threadId = attachedThread?.id != null
+        ? String(attachedThread.id)
+        : message.thread_id != null
+          ? String(message.thread_id)
+          : null
+      if (!threadId || attachedThread || knownThreadById.has(threadId) || seen.has(threadId)) return
+
+      const channelThreadCandidate = channels.find((candidate) => String(candidate.id) === threadId)
+      if (isThreadChannel(channelThreadCandidate)) return
+
+      seen.add(threadId)
+      ordered.push(threadId)
+    })
+
+    return ordered
+  }, [channelMessages, channels, knownThreadById])
+
+  const missingThreadLookupQueries = useQueries({
+    queries: missingThreadLookupTargets.map((threadId) => ({
+      queryKey: ['thread-link', serverId, threadId],
+      queryFn: async (): Promise<MissingThreadLookupResult> => {
+        try {
+          const res = await guildApi.guildGuildIdChannelChannelIdGet({
+            guildId: serverId!,
+            channelId: threadId,
+          })
+
+          return {
+            thread: isThreadChannel(res.data) ? res.data : null,
+            missing: false,
+          }
+        } catch (error) {
+          if (isThreadLookupNotFound(error)) {
+            return { thread: null, missing: true }
+          }
+          throw error
+        }
+      },
+      enabled: !!serverId,
+      retry: false,
+      staleTime: 60_000,
+    })),
+  })
+
+  const fetchedThreadById = useMemo(() => {
+    const map = new Map<string, DtoChannel>()
+
+    missingThreadLookupTargets.forEach((threadId, index) => {
+      const result = missingThreadLookupQueries[index]?.data
+      if (result?.thread) {
+        map.set(threadId, result.thread)
+      }
+    })
+
+    return map
+  }, [missingThreadLookupQueries, missingThreadLookupTargets])
+
+  const missingThreadIds = useMemo(() => {
+    const ids = new Set<string>()
+
+    missingThreadLookupTargets.forEach((threadId, index) => {
+      if (missingThreadLookupQueries[index]?.data?.missing) {
+        ids.add(threadId)
+      }
+    })
+
+    return ids
+  }, [missingThreadLookupQueries, missingThreadLookupTargets])
+
+  const threadById = useMemo(() => {
+    const map = new Map(knownThreadById)
+    fetchedThreadById.forEach((thread, threadId) => {
+      map.set(threadId, thread)
+    })
+    return map
+  }, [fetchedThreadById, knownThreadById])
+
+  useEffect(() => {
+    if (!serverId) return
+
+    const readStateStore = useReadStateStore.getState()
+    const unreadStore = useUnreadStore.getState()
+    const mentionStore = useMentionStore.getState()
+
+    threadById.forEach((_, threadId) => {
+      if (readStateStore.isUnread(threadId)) {
+        unreadStore.markUnread(threadId, serverId)
+      }
+      if (mentionStore.getChannelMentionCount(threadId) > 0) {
+        mentionStore.associateGuild(threadId, serverId)
+      }
+    })
+  }, [serverId, threadById])
+
+  const renderedThreadTargets = useMemo(() => {
+    const ordered: DtoChannel[] = []
+    const seen = new Set<string>()
+    const addThread = (thread: DtoChannel | null | undefined) => {
+      if (!isThreadChannel(thread) || thread.id == null) return
+      const id = String(thread.id)
+      if (seen.has(id)) return
+      seen.add(id)
+      ordered.push(thread)
+    }
+
+    channelMessages.forEach((message) => {
+      if (message.type !== 0 || message.thread_id == null) return
+      addThread(isThreadChannel(message.thread) ? message.thread : threadById.get(String(message.thread_id)))
+    })
+
+    return ordered
+  }, [channelMessages, threadById])
+
+  const shouldLoadThreadListPreviews = rightPanelMode === 'threads'
+
+  const threadPreviewTargets = useMemo(() => {
+    const ordered: DtoChannel[] = []
+    const seen = new Set<string>()
+    const addThread = (thread: DtoChannel | null | undefined) => {
+      if (!isThreadChannel(thread) || thread.id == null) return
+      const id = String(thread.id)
+      if (seen.has(id)) return
+      seen.add(id)
+      ordered.push(thread)
+    }
+
+    renderedThreadTargets.forEach(addThread)
+    if (shouldLoadThreadListPreviews) {
+      channelThreads.forEach(addThread)
+    }
+
+    return ordered
+  }, [channelThreads, renderedThreadTargets, shouldLoadThreadListPreviews])
+
+  const threadPreviewQueries = useQueries({
+    queries: threadPreviewTargets.map((thread) => ({
+      queryKey: ['thread-preview', String(thread.id), String(thread.last_message_id ?? 0)],
+      queryFn: async () => {
+        if (thread.last_message_id == null) return null
+        const res = await messageApi.messageChannelChannelIdGet({
+          channelId: String(thread.id),
+          limit: THREAD_PREVIEW_FETCH_LIMIT,
+        })
+        return res.data?.[0] ?? null
+      },
+      enabled: thread.last_message_id != null,
+      staleTime: 30_000,
+    })),
+  })
+
+  const threadPreviewMessageMap = useMemo(() => {
+    const previews: Record<string, DtoMessage | null> = {}
+    threadPreviewTargets.forEach((thread, index) => {
+      const threadId = String(thread.id)
+      const storedMessages = threadMessages[threadId] ?? []
+      previews[threadId] = storedMessages[storedMessages.length - 1] ?? threadPreviewQueries[index]?.data ?? null
+    })
+    return previews
+  }, [threadMessages, threadPreviewQueries, threadPreviewTargets])
+
+  const threadPreviewMap = useMemo(() => {
+    const previews: Record<string, string> = {}
+    channelThreads.forEach((thread) => {
+      previews[String(thread.id)] = buildThreadPreviewText(
+        threadPreviewMessageMap[String(thread.id)],
+        t,
+      )
+    })
+    return previews
+  }, [channelThreads, threadPreviewMessageMap, t])
+
+  const memberColorMap = useMemo(() => {
+    const colors: Record<string, string> = {}
+    if (!members?.length || !roles?.length) return colors
+
+    members.forEach((member) => {
+      const userId = member.user?.id != null ? String(member.user.id) : null
+      if (!userId) return
+      const color = getTopRoleColor(member.roles, roles)
+      if (color) {
+        colors[userId] = color
+      }
+    })
+
+    return colors
+  }, [members, roles])
+
+  const openUserProfile = useUiStore((s) => s.openUserProfile)
+
+  const handleUserClick = useCallback(
+    (userId: string, x: number, y: number) => {
+      openUserProfile(userId, serverId ?? null, x, y)
+    },
+    [openUserProfile, serverId],
+  )
+
+  const handleChannelClick = useCallback(
+    (targetChannelId: string) => {
+      navigate(`/app/${serverId}/${targetChannelId}`)
+    },
+    [navigate, serverId],
+  )
+
+  const mentionResolver = useMemo<MentionResolver>(
+    () => ({
+      user: (id) => {
+        const m = members?.find((m) => String(m.user?.id) === id)
+        return m?.username ?? m?.user?.name
+      },
+      channel: (id) => {
+        const thread = channelThreads?.find((c) => String(c.id) === id)
+        return thread?.name ?? channels.find((c) => String(c.id) === id)?.name
+      },
+      role: (id) => roles?.find((r) => String(r.id) === id)?.name,
+      onUserClick: handleUserClick,
+      onChannelClick: handleChannelClick,
+    }),
+    [members, channelThreads, channels, roles, handleUserClick, handleChannelClick],
+  )
+
+  const clearSearch = useCallback(() => {
+    setSearchResults([])
+    setSearchTotalPages(0)
+    setSearchPage(0)
+    setIsSearching(false)
+    setHasSearched(false)
+    lastSearchParamsRef.current = null
+    searchBarRef.current?.clear()
+  }, [])
+
+  useEffect(() => {
+    if (!channelId || isVoice) return
+    activateChannel(channelId)
+    return () => {
+      deactivateChannel(channelId)
+    }
+  }, [channelId, isVoice])
+
+  useEffect(() => {
+    if (!isVoice || !serverId || !channelId || voiceChannelId !== channelId || voiceConnectionState !== 'connected') return
+    void syncChannelStreams(serverId, channelId)
+  }, [channelId, isVoice, serverId, voiceChannelId, voiceConnectionState])
+
+  // Clear search when navigating to a different channel
+  useEffect(() => {
+    clearSearch()
+    setRightPanelMode(isMobile ? 'none' : 'members')
+    setRightPanelModeBeforeThreads('members')
+    setJumpRequest(null)
+    setActiveThreadId(null)
+    setThreadJumpRequest(null)
+    setCreateThreadSource(null)
+    setReplyTarget(null)
+  }, [channelId, clearSearch])
+
+  async function doSearch(params: { chips: AppliedFilter[]; text: string }, pageNum: number) {
+    const content = params.text
+    const hasFilters = params.chips.filter((f) => f.type === 'has').map((f) => f.apiValue as SearchMessageSearchRequestHasEnum)
+    const fromChip = params.chips.find((f) => f.type === 'from')
+    const inChip = params.chips.find((f) => f.type === 'in')
+
+    if (!content && !hasFilters.length && !fromChip && !inChip) return
+
+    const targetChannelId = inChip?.apiValue ?? channelId!
+    lastSearchParamsRef.current = params
+
+    setIsSearching(true)
+    setHasSearched(true)
+    try {
+      const res = await searchApi.searchGuildIdMessagesPost({
+        guildId: serverId!,
+        request: {
+          content: content || undefined,
+          author_id: fromChip ? (fromChip.apiValue as unknown as string) : undefined,
+          channel_id: targetChannelId as unknown as string,
+          has: hasFilters.length ? hasFilters : undefined,
+          page: pageNum,
+        },
+      })
+      const raw = res.data
+      const first = Array.isArray(raw) ? raw[0] : raw
+      setSearchResults((first as { messages?: DtoMessage[] })?.messages ?? [])
+      setSearchTotalPages((first as { pages?: number })?.pages ?? 1)
+      setSearchPage(pageNum)
+    } catch {
+      setSearchResults([])
+      setSearchTotalPages(0)
+    } finally {
+      setIsSearching(false)
+    }
+  }
+
+  function goToPage(page: number) {
+    if (lastSearchParamsRef.current) {
+      void doSearch(lastSearchParamsRef.current, page)
+    }
+  }
+
+  const openThread = useCallback((
+    threadId: string,
+    options?: {
+      jumpToMessageId?: string
+      jumpBehavior?: JumpBehavior
+      jumpPosition?: number | null
+    },
+  ) => {
+    clearSearch()
+    setCreateThreadSource(null)
+    setRightPanelModeBeforeThreads((current) => (
+      isThreadRightPanelMode(rightPanelMode) ? current : toNonThreadRightPanelMode(rightPanelMode)
+    ))
+    setActiveThreadId(threadId)
+    setThreadJumpRequest(
+      options?.jumpToMessageId
+        ? createJumpRequest(options.jumpToMessageId, {
+            behavior: options.jumpBehavior ?? 'direct-scroll',
+            positionHint: options.jumpPosition ?? null,
+          })
+        : null,
+    )
+    setRightPanelMode('thread')
+  }, [clearSearch, rightPanelMode])
+
+  const openThreadList = useCallback(() => {
+    clearSearch()
+    setCreateThreadSource(null)
+    setRightPanelModeBeforeThreads((current) => (
+      isThreadRightPanelMode(rightPanelMode) ? current : toNonThreadRightPanelMode(rightPanelMode)
+    ))
+    setActiveThreadId(null)
+    setThreadJumpRequest(null)
+    setRightPanelMode('threads')
+  }, [clearSearch, rightPanelMode])
+
+  function handleThreadButtonClick() {
+    clearSearch()
+    setCreateThreadSource(null)
+    setActiveThreadId(null)
+    setThreadJumpRequest(null)
+    setRightPanelMode((mode) => {
+      if (isThreadRightPanelMode(mode)) return rightPanelModeBeforeThreads
+      setRightPanelModeBeforeThreads(toNonThreadRightPanelMode(mode))
+      return 'threads'
+    })
+  }
+
+  function handleMembersButtonClick() {
+    clearSearch()
+    setCreateThreadSource(null)
+    setRightPanelMode((mode) => (mode === 'members' ? 'none' : 'members'))
+  }
+
+  const handleCreateThreadAction = useCallback((message: DtoMessage) => {
+    clearSearch()
+    setRightPanelModeBeforeThreads((current) => (
+      isThreadRightPanelMode(rightPanelMode) ? current : toNonThreadRightPanelMode(rightPanelMode)
+    ))
+    setCreateThreadSource(message)
+    setRightPanelMode('thread-create')
+  }, [clearSearch, rightPanelMode])
+
+  const handleCreateThread = useCallback(async ({
+    name,
+    content,
+    attachmentIds,
+    nonce,
+    sourceMessageId,
+  }: {
+    name?: string
+    content: string
+    attachmentIds: number[]
+    nonce: string
+    sourceMessageId: string
+  }) => {
+    if (!channelId) return
+    const res = await messageApi.messageChannelChannelIdMessageIdThreadPost({
+      channelId: channelId as unknown as number,
+      messageId: sourceMessageId as unknown as number,
+      request: {
+        name,
+        content,
+        attachments: attachmentIds.length > 0 ? attachmentIds : undefined,
+        nonce,
+      },
+    })
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ['channels', serverId] }),
+      queryClient.invalidateQueries({ queryKey: ['channel-threads', serverId, channelId] }),
+    ])
+    openThread(String(res.data.id))
+  }, [channelId, openThread, queryClient, serverId])
+
+  const openMessageLocation = useCallback(async (
+    targetChannelId: string,
+    messageId: string,
+    options?: {
+      jumpBehavior?: JumpBehavior
+      jumpPosition?: number | null
+    },
+  ) => {
+    if (!serverId) return
+    const jumpBehavior = options?.jumpBehavior ?? 'direct-scroll'
+
+    if (targetChannelId === channelId) {
+      setJumpRequest(createJumpRequest(messageId, {
+        behavior: jumpBehavior,
+        positionHint: options?.jumpPosition ?? null,
+      }))
+      return
+    }
+
+    if (targetChannelId === activeThreadId) {
+      openThread(targetChannelId, {
+        jumpToMessageId: messageId,
+        jumpBehavior,
+        jumpPosition: options?.jumpPosition ?? null,
+      })
+      return
+    }
+
+    const knownChannel = threadById.get(targetChannelId)
+      ?? channels.find((c) => String(c.id) === targetChannelId)
+
+    if (isThreadChannel(knownChannel) && knownChannel.parent_id != null) {
+      if (String(knownChannel.parent_id) === channelId) {
+        openThread(targetChannelId, {
+          jumpToMessageId: messageId,
+          jumpBehavior,
+          jumpPosition: options?.jumpPosition ?? null,
+        })
+        return
+      }
+
+      navigate(`/app/${serverId}/${String(knownChannel.parent_id)}`, {
+        state: {
+          openThreadId: targetChannelId,
+          threadJumpToMessageId: messageId,
+          threadJumpBehavior: jumpBehavior,
+          threadJumpToMessagePosition: options?.jumpPosition ?? undefined,
+        } satisfies ChannelPageLocationState,
+      })
+      return
+    }
+
+    if (!knownChannel) {
+      try {
+        const res = await guildApi.guildGuildIdChannelChannelIdGet({
+          guildId: serverId,
+          channelId: targetChannelId,
+        })
+        if (isThreadChannel(res.data) && res.data.parent_id != null) {
+          if (String(res.data.parent_id) === channelId) {
+            openThread(targetChannelId, {
+              jumpToMessageId: messageId,
+              jumpBehavior,
+              jumpPosition: options?.jumpPosition ?? null,
+            })
+            return
+          }
+
+          navigate(`/app/${serverId}/${String(res.data.parent_id)}`, {
+            state: {
+              openThreadId: targetChannelId,
+              threadJumpToMessageId: messageId,
+              threadJumpBehavior: jumpBehavior,
+              threadJumpToMessagePosition: options?.jumpPosition ?? undefined,
+            } satisfies ChannelPageLocationState,
+          })
+          return
+        }
+      } catch {
+        // Fall back to the default channel jump below.
+      }
+    }
+
+    navigate(`/app/${serverId}/${targetChannelId}`, {
+      state: {
+        jumpToMessageId: messageId,
+        jumpBehavior,
+        jumpToMessagePosition: options?.jumpPosition ?? undefined,
+      } satisfies ChannelPageLocationState,
+    })
+  }, [activeThreadId, channelId, channels, navigate, openThread, serverId, threadById])
+
+  async function handleSearchJump(msg: DtoMessage) {
+    if (msg.channel_id == null || msg.id == null) return
+    await openMessageLocation(String(msg.channel_id), String(msg.id), {
+      jumpBehavior: 'direct-scroll',
+      jumpPosition: msg.position ?? null,
+    })
+    if (isMobile) {
+      clearSearch()
+      setMobileSearchOpen(false)
+    }
+  }
+
+  useEffect(() => {
+    if (!activeThreadId || activeThread || isActiveThreadLoading) return
+    setActiveThreadId(null)
+    setThreadJumpRequest(null)
+    setRightPanelMode('threads')
+  }, [activeThread, activeThreadId, isActiveThreadLoading])
+
+  if (!channelId) return null
+
+  const Icon = isVoice ? Volume2 : Hash
+
+  async function handleJoinVoice() {
+    if (!channel || !serverId || !channelId) return
+    try {
+      const res = await guildApi.guildGuildIdVoiceChannelIdJoinPost({ guildId: serverId, channelId })
+      if (res.data.sfu_url && res.data.sfu_token) {
+        let voiceRegion = res.data.region ?? channel.voice_region ?? undefined
+        if (!voiceRegion) {
+          voiceRegion = (await guildApi.guildGuildIdChannelChannelIdGet({
+            guildId: serverId as unknown as number,
+            channelId: channelId as unknown as number,
+          }))
+            .data.voice_region ?? undefined
+        }
+        await joinVoice(serverId, channelId, channel.name ?? channelId, res.data.sfu_url, res.data.sfu_token, guild?.name ?? undefined, voiceRegion)
+      }
+    } catch {
+      toast.error(t('channelSidebar.joinVoiceFailed'))
+    }
+  }
+
+  function voiceToggleMute() {
+    if (localMuted && localDeafened) {
+      setDeafened(false)
+      setMuted(false)
+    } else {
+      setMuted(!localMuted)
+    }
+  }
+
+  function voiceToggleDeafen() {
+    setDeafened(!localDeafened)
+  }
+
+  function voiceToggleCamera() {
+    if (localCameraEnabled) {
+      disableCamera()
+    } else {
+      void enableCamera().catch((error) => {
+        toast.error(error instanceof Error ? error.message : t('voicePanel.cameraFailed'))
+      })
+    }
+  }
+
+  const canManageActiveThread = !!activeThread && (
+    canManageThreads ||
+    (currentUser?.id !== undefined && String(activeThread.creator_id) === String(currentUser.id))
+  )
+
+  const getParentMessageProps = useCallback(function getParentMessageProps(msg: DtoMessage) {
+    const isInformationalMessage = msg.type === 2 || msg.type === 3 || msg.type === 4
+    const canReply =
+      !isAutoThreadFollowup(msg) &&
+      msg.id != null
+    const attachedThread = isThreadChannel(msg.thread) ? msg.thread : null
+    const threadId = attachedThread?.id != null
+      ? String(attachedThread.id)
+      : msg.thread_id != null
+        ? String(msg.thread_id)
+        : null
+    const channelThreadCandidate = threadId
+      ? channels.find((candidate) => String(candidate.id) === threadId)
+      : null
+    const linkedThread = attachedThread
+      ?? (threadId ? threadById.get(threadId) : null)
+      ?? (isThreadChannel(channelThreadCandidate) ? channelThreadCandidate : null)
+    const isMissingThread = threadId != null && missingThreadIds.has(threadId)
+    const threadPreviewMessage = threadId ? threadPreviewMessageMap[threadId] ?? null : null
+    const threadPreview = msg.type === 0 && threadId && linkedThread
+      ? {
+          name: linkedThread.name ?? t('threads.threadFallback'),
+          topic: linkedThread.topic?.trim() ? linkedThread.topic.trim() : null,
+          previewMessage: threadPreviewMessage,
+          previewText: buildThreadPreviewText(threadPreviewMessage, t),
+          onClick: () => openThread(threadId),
+        }
+      : undefined
+
+    const threadBadge = threadId && !threadPreview
+      ? {
+          label: isMissingThread
+            ? t('threads.missingThread')
+            : linkedThread?.name ?? t('threads.threadFallback'),
+          onClick: isMissingThread ? undefined : () => openThread(threadId),
+        }
+      : undefined
+
+    const threadAction = threadId && !isMissingThread
+      ? {
+          label: t('threads.openThread'),
+          onClick: () => openThread(threadId),
+        }
+      : (
+        isTextChannel &&
+        canCreateThreads &&
+        msg.id != null &&
+        !isInformationalMessage
+      )
+        ? {
+            label: t('threads.createThread'),
+            onClick: () => handleCreateThreadAction(msg),
+          }
+        : undefined
+
+    return {
+      threadPreview,
+      threadBadge,
+      threadAction,
+      replyAction: canReply ? {
+        label: t('messageItem.reply'),
+        onClick: () => setReplyTarget(msg),
+      } : undefined,
+      threadListAction: isTextChannel ? {
+        label: t('threads.title'),
+        onClick: openThreadList,
+      } : undefined,
+      onOpenReference: ({ channelId: targetChannelId, messageId }: { channelId: string; messageId: string }) => {
+        void openMessageLocation(targetChannelId, messageId)
+      },
+      hideContent: threadBadge != null && isAutoThreadFollowup(msg),
+      allowEdit: !isInformationalMessage,
+      allowDelete: true,
+    }
+  }, [channels, threadById, missingThreadIds, threadPreviewMessageMap, t, openThread, handleCreateThreadAction, setReplyTarget, openThreadList, openMessageLocation, isTextChannel, canCreateThreads])
+
+  const threadButtonActive =
+    rightPanelMode === 'threads' ||
+    rightPanelMode === 'thread' ||
+    rightPanelMode === 'thread-create'
+  const isThreadSidePanelVisible =
+    !hasSearched &&
+    (
+      rightPanelMode === 'threads' ||
+      rightPanelMode === 'thread' ||
+      rightPanelMode === 'thread-create'
+    )
+  const activeRightPanelWidthKey = getRightPanelWidthKey(hasSearched, rightPanelMode)
+  const activeRightPanelWidth = clampRightPanelWidth(
+    rightPanelWidths[activeRightPanelWidthKey] ?? DEFAULT_RIGHT_PANEL_WIDTHS[activeRightPanelWidthKey],
+  )
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    try {
+      // thread/threadCreate widths are intentionally excluded — they always open at their default
+      const { thread: _t, threadCreate: _tc, ...persistedWidths } = rightPanelWidths
+      window.localStorage.setItem(RIGHT_PANEL_WIDTH_STORAGE_KEY, JSON.stringify(persistedWidths))
+    } catch {
+      // Ignore storage failures and keep the in-memory widths.
+    }
+  }, [rightPanelWidths])
+
+  // Reset thread/threadCreate widths to default each time they open
+  useEffect(() => {
+    if (rightPanelMode === 'thread') {
+      setRightPanelWidths((current) => ({ ...current, thread: DEFAULT_RIGHT_PANEL_WIDTHS.thread }))
+    } else if (rightPanelMode === 'thread-create') {
+      setRightPanelWidths((current) => ({ ...current, threadCreate: DEFAULT_RIGHT_PANEL_WIDTHS.threadCreate }))
+    }
+  }, [rightPanelMode])
+
+  useEffect(() => {
+    const handleResize = () => {
+      const containerWidth = contentContainerRef.current?.offsetWidth
+      setRightPanelWidths((current) => {
+        let changed = false
+        const next = { ...current }
+        RIGHT_PANEL_WIDTH_KEYS.forEach((key) => {
+          const currentWidth = current[key] ?? DEFAULT_RIGHT_PANEL_WIDTHS[key]
+          const clamped = clampRightPanelWidth(currentWidth, containerWidth)
+          if (clamped !== currentWidth) {
+            next[key] = clamped
+            changed = true
+          }
+        })
+        return changed ? next : current
+      })
+    }
+
+    window.addEventListener('resize', handleResize)
+    return () => {
+      window.removeEventListener('resize', handleResize)
+    }
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      rightPanelResizeCleanupRef.current?.()
+    }
+  }, [])
+
+  const handleRightPanelResizeStart = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    if (!isThreadSidePanelVisible) return
+    event.preventDefault()
+
+    rightPanelResizeCleanupRef.current?.()
+
+    const widthKey = getRightPanelWidthKey(hasSearched, rightPanelMode)
+    const startX = event.clientX
+    const startWidth = rightPanelWidths[widthKey] ?? DEFAULT_RIGHT_PANEL_WIDTHS[widthKey]
+    const containerWidth = contentContainerRef.current?.offsetWidth
+    const previousUserSelect = document.body.style.userSelect
+    const previousCursor = document.body.style.cursor
+
+    const handlePointerMove = (moveEvent: PointerEvent) => {
+      const nextWidth = clampRightPanelWidth(startWidth + (startX - moveEvent.clientX), containerWidth)
+      setRightPanelWidths((current) => {
+        if ((current[widthKey] ?? DEFAULT_RIGHT_PANEL_WIDTHS[widthKey]) === nextWidth) {
+          return current
+        }
+        return { ...current, [widthKey]: nextWidth }
+      })
+    }
+
+    const stopResizing = () => {
+      window.removeEventListener('pointermove', handlePointerMove)
+      window.removeEventListener('pointerup', stopResizing)
+      window.removeEventListener('pointercancel', stopResizing)
+      document.body.style.userSelect = previousUserSelect
+      document.body.style.cursor = previousCursor
+      rightPanelResizeCleanupRef.current = null
+    }
+
+    document.body.style.userSelect = 'none'
+    document.body.style.cursor = 'col-resize'
+    window.addEventListener('pointermove', handlePointerMove)
+    window.addEventListener('pointerup', stopResizing)
+    window.addEventListener('pointercancel', stopResizing)
+    rightPanelResizeCleanupRef.current = stopResizing
+  }, [hasSearched, isThreadSidePanelVisible, rightPanelMode, rightPanelWidths])
+
+  // Voice channel view
+  if (isVoice) {
+    const isConnected = voiceChannelId === channelId
+    const currentUserId = String(currentUser?.id ?? '')
+    const peerEntries = Object.entries(voicePeers).filter(([userId]) => userId !== currentUserId)
+    const localDisplayName = currentUser?.name ?? t('channel.you')
+    const streamTileId = (streamId: string) => `stream:${streamId}`
+    const memberByUserId = (userId: string) => members?.find((m) => String(m.user?.id) === userId)
+    const displayNameForUser = (userId: string) => {
+      if (userId === currentUserId) return localDisplayName
+      const member = memberByUserId(userId)
+      return member?.username ?? member?.user?.name ?? `User ${userId.slice(0, 6)}`
+    }
+    const avatarForUser = (userId: string) => {
+      if (userId === currentUserId) return currentUser?.avatar?.url
+      return memberByUserId(userId)?.user?.avatar?.url
+    }
+
+    async function handleWatchParticipantStream(participantId: string, streamId: string) {
+      if (!serverId || !channelId) return
+      const stream = channelStreams.find((item) => item.id === streamId)
+      if (!stream) return
+      try {
+        await watchStream(serverId, channelId, stream)
+        setSpotlightId(participantId)
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : 'Failed to watch stream')
+      }
+    }
+
+    function handleStopParticipantStream(participantId: string, streamId: string) {
+      stopWatchingStream(streamId)
+      if (spotlightId === participantId) {
+        setSpotlightId(null)
+      }
+    }
+
+    async function handleReconnectParticipantStream(participantId: string, streamId: string) {
+      try {
+        await reconnectStream(streamId)
+        setSpotlightId(participantId)
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : 'Failed to reconnect stream')
+      }
+    }
+
+    // Normalised list of all voice participants. Camera/avatar tiles stay separate
+    // from stream tiles so a screen share never replaces the user's webcam feed.
+    const userParticipants: VoiceParticipantItem[] = [
+      {
+        id: 'user:local',
+        label: localDisplayName,
+        avatarUrl: currentUser?.avatar?.url,
+        speaking: localSpeaking,
+        muted: localMuted,
+        deafened: localDeafened,
+        videoStream: localCameraEnabled ? localVideoStream : null,
+        isLocal: true as const,
+        streamSummary: null,
+        streamConnectionState: null,
+        streamError: null,
+        isWatchingStream: false,
+        videoMuted: true,
+        videoVolume: 1,
+      },
+      ...peerEntries.map(([userId, peer]) => {
+        return {
+          id: `user:${userId}`,
+          label: displayNameForUser(userId),
+          avatarUrl: avatarForUser(userId),
+          speaking: peer.speaking,
+          muted: peer.muted,
+          deafened: peer.deafened,
+          videoStream: peer.videoStream,
+          isLocal: false as const,
+          streamSummary: null,
+          streamConnectionState: null,
+          streamError: null,
+          isWatchingStream: false,
+          videoMuted: true,
+          videoVolume: 1,
+        }
+      }),
+    ]
+    const hasLocalPublishedStreamTile = !!publishing?.streamId && channelStreams.some((stream) => stream.id === publishing.streamId)
+    const localPublishingStreamSummary: ParticipantStreamSummary | null =
+      publishing?.channelId === channelId && publishing.streamId
+        ? {
+            id: publishing.streamId,
+            ownerUserId: publishing.ownerUserId,
+            audioMode: publishing.audioMode,
+          }
+        : null
+    const channelStreamTiles: VoiceParticipantItem[] = channelStreams.map((stream) => {
+      const watchedStream = watchedStreams[stream.id] ?? null
+      const isOwnerLocal = stream.ownerUserId === currentUserId
+      const localPreviewStream = isOwnerLocal && publishing?.streamId === stream.id ? publishing.previewStream : null
+      return {
+        id: streamTileId(stream.id),
+        label: `${displayNameForUser(stream.ownerUserId)} · ${t('streams.liveBadge')}`,
+        avatarUrl: avatarForUser(stream.ownerUserId),
+        speaking: false,
+        muted: isOwnerLocal ? localMuted : voicePeers[stream.ownerUserId]?.muted ?? false,
+        deafened: isOwnerLocal ? localDeafened : voicePeers[stream.ownerUserId]?.deafened ?? false,
+        videoStream: localPreviewStream ?? watchedStream?.mediaStream ?? null,
+        isLocal: isOwnerLocal,
+        mirrorVideo: false,
+        streamSummary: stream,
+        streamConnectionState: watchedStream?.connectionState ?? (isOwnerLocal && publishing?.streamId === stream.id ? publishing.connectionState : null),
+        streamError: watchedStream?.error ?? (isOwnerLocal && publishing?.streamId === stream.id ? publishing.error : null),
+        isWatchingStream: !!watchedStream,
+        videoMuted: watchedStream ? watchedStream.muted : true,
+        videoVolume: watchedStream ? watchedStream.volume / 100 : 1,
+        isStreamTile: true,
+      }
+    })
+    const localStreamPreview: VoiceParticipantItem | null =
+      publishing?.channelId === channelId && publishing.previewStream && localPublishingStreamSummary && !hasLocalPublishedStreamTile
+        ? {
+            id: streamTileId(publishing.streamId),
+            label: `${localDisplayName} · ${t('streams.liveBadge')}`,
+            avatarUrl: currentUser?.avatar?.url,
+            speaking: false,
+            muted: localMuted,
+            deafened: localDeafened,
+            videoStream: publishing.previewStream,
+            isLocal: true,
+            mirrorVideo: false,
+            streamSummary: localPublishingStreamSummary,
+            streamConnectionState: publishing.connectionState,
+            streamError: publishing.error,
+            isWatchingStream: false,
+            videoMuted: true,
+            videoVolume: 1,
+            isStreamTile: true,
+          }
+        : null
+    const streamParticipants = localStreamPreview
+      ? [...channelStreamTiles, localStreamPreview]
+      : channelStreamTiles
+    const visibleParticipants = [...userParticipants, ...streamParticipants]
+    const canControlStreamTile = (participant: VoiceParticipantItem) =>
+      !!participant.isStreamTile && !!participant.streamSummary && participant.streamSummary.ownerUserId !== currentUserId
+
+    const spotlightParticipant = spotlightId ? visibleParticipants.find((p) => p.id === spotlightId) ?? null : null
+    const stripParticipants = spotlightId ? visibleParticipants.filter((p) => p.id !== spotlightId) : []
+    const streamButtonDisabled = isStartingStream || (!isStreamingHere && voiceConnectionState !== 'connected')
+
+    return (
+      <div className="flex flex-col flex-1 min-h-0">
+        <div
+          className={cn(
+            'border-b border-sidebar-border flex items-center gap-2 shrink-0 bg-background',
+            isMobile ? 'min-h-[60px] px-3 pt-[env(safe-area-inset-top)]' : 'h-12 px-4',
+          )}
+        >
+          {isMobile && (
+            <button
+              onClick={() => navigate(`/app/${serverId}`)}
+              className="w-11 h-11 flex items-center justify-center rounded-full text-muted-foreground hover:text-foreground active:bg-accent transition-colors shrink-0 -ml-1"
+              title="Back to channels"
+            >
+              <ChevronLeft className="w-5 h-5" />
+            </button>
+          )}
+          <Icon className="w-5 h-5 text-muted-foreground shrink-0" />
+          <span className="min-w-0 truncate font-semibold">{channel?.name ?? channelId}</span>
+          {!isMobile && channel?.topic && (
+            <>
+              <Separator orientation="vertical" className="h-5 mx-1" />
+              <span className="text-sm text-muted-foreground truncate">{channel.topic}</span>
+            </>
+          )}
+        </div>
+
+        {isConnected ? (
+          spotlightParticipant ? (
+            /* ── Spotlight layout ─────────────────────────────────────────── */
+            <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
+              {/* Main spotlight area */}
+              <div className="flex-1 min-h-0 flex items-center justify-center p-4">
+                <VoiceParticipant
+                  {...spotlightParticipant}
+                  size="spotlight"
+                  onClick={() => setSpotlightId(null)}
+                />
+              </div>
+              {/* Bottom strip */}
+              <div className="shrink-0 flex gap-3 px-4 pb-3 overflow-x-auto border-t border-sidebar-border pt-3">
+                {stripParticipants.map((p) => {
+                  const streamId = p.streamSummary?.id ?? ''
+                  const canControlStream = !!streamId && canControlStreamTile(p)
+                  return (
+                    <VoiceParticipant
+                      key={p.id}
+                      {...p}
+                      size="compact"
+                      onClick={
+                        canControlStream && !p.isWatchingStream
+                          ? () => { void handleWatchParticipantStream(p.id, streamId) }
+                          : p.videoStream
+                            ? () => setSpotlightId(p.id)
+                            : undefined
+                      }
+                      onWatchStream={
+                        canControlStream && !p.isWatchingStream
+                          ? () => { void handleWatchParticipantStream(p.id, streamId) }
+                          : undefined
+                      }
+                      onStopWatching={
+                        canControlStream && p.isWatchingStream
+                          ? () => handleStopParticipantStream(p.id, streamId)
+                          : undefined
+                      }
+                      onReconnectStream={
+                        canControlStream && p.streamConnectionState === 'error'
+                          ? () => { void handleReconnectParticipantStream(p.id, streamId) }
+                          : undefined
+                      }
+                    />
+                  )
+                })}
+              </div>
+            </div>
+          ) : (
+            /* ── Grid layout ──────────────────────────────────────────────── */
+            <div className="flex-1 flex flex-col items-center justify-center gap-4 p-6 overflow-auto">
+              <p className="text-sm text-muted-foreground">
+                {peerEntries.length === 0
+                  ? t('channel.connected', { count: 1 })
+                  : t('channel.connected_plural', { count: peerEntries.length + 1 })}
+              </p>
+              <div className="flex flex-wrap justify-center gap-4 w-full">
+                {visibleParticipants.map((p) => {
+                  const streamId = p.streamSummary?.id ?? ''
+                  const canControlStream = !!streamId && canControlStreamTile(p)
+                  return (
+                    <VoiceParticipant
+                      key={p.id}
+                      {...p}
+                      onClick={
+                        canControlStream && !p.isWatchingStream
+                          ? () => { void handleWatchParticipantStream(p.id, streamId) }
+                          : p.videoStream
+                            ? () => setSpotlightId(p.id)
+                            : undefined
+                      }
+                      onWatchStream={
+                        canControlStream && !p.isWatchingStream
+                          ? () => { void handleWatchParticipantStream(p.id, streamId) }
+                          : undefined
+                      }
+                      onStopWatching={
+                        canControlStream && p.isWatchingStream
+                          ? () => handleStopParticipantStream(p.id, streamId)
+                          : undefined
+                      }
+                      onReconnectStream={
+                        canControlStream && p.streamConnectionState === 'error'
+                          ? () => { void handleReconnectParticipantStream(p.id, streamId) }
+                          : undefined
+                      }
+                    />
+                  )
+                })}
+              </div>
+            </div>
+          )
+        ) : (
+          <div className="flex-1 flex flex-col items-center justify-center gap-4 p-6">
+            <div className="w-16 h-16 rounded-full bg-muted flex items-center justify-center">
+              <Volume2 className="w-8 h-8 text-muted-foreground" />
+            </div>
+            <h3 className="text-xl font-bold">{channel?.name}</h3>
+            <p className="text-sm text-muted-foreground">
+              {t('channel.clickToJoin')}
+            </p>
+          </div>
+        )}
+
+        {/* Voice control bar */}
+        <div className="shrink-0 border-t border-sidebar-border bg-background px-4 py-3 flex items-center justify-center gap-2">
+          {isConnected ? (
+            <>
+              <button
+                onClick={voiceToggleMute}
+                title={localMuted ? t('voicePanel.unmute') : t('voicePanel.mute')}
+                className={cn(
+                  'flex items-center justify-center w-10 h-10 rounded-full transition-colors',
+                  localMuted
+                    ? 'bg-destructive/20 text-destructive hover:bg-destructive/30'
+                    : localSpeaking
+                      ? 'bg-green-500/20 text-green-400 hover:bg-green-500/30'
+                      : 'bg-muted hover:bg-accent text-muted-foreground hover:text-foreground',
+                )}
+              >
+                {localMuted ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
+              </button>
+              <button
+                onClick={voiceToggleDeafen}
+                title={localDeafened ? t('voicePanel.undeafen') : t('voicePanel.deafen')}
+                className={cn(
+                  'flex items-center justify-center w-10 h-10 rounded-full transition-colors',
+                  localDeafened
+                    ? 'bg-destructive/20 text-destructive hover:bg-destructive/30'
+                    : 'bg-muted hover:bg-accent text-muted-foreground hover:text-foreground',
+                )}
+              >
+                {localDeafened ? <HeadphoneOff className="w-5 h-5" /> : <Headphones className="w-5 h-5" />}
+              </button>
+              <button
+                onClick={voiceToggleCamera}
+                title={localCameraEnabled ? t('voicePanel.cameraOff') : t('voicePanel.cameraOn')}
+                className={cn(
+                  'flex items-center justify-center w-10 h-10 rounded-full transition-colors',
+                  localCameraEnabled
+                    ? 'bg-primary/20 text-primary hover:bg-primary/30'
+                    : 'bg-muted hover:bg-accent text-muted-foreground hover:text-foreground',
+                )}
+              >
+                {localCameraEnabled ? <Video className="w-5 h-5" /> : <VideoOff className="w-5 h-5" />}
+              </button>
+              <button
+                onClick={() => { void handleToggleChannelStream() }}
+                disabled={streamButtonDisabled || !displayMediaSupported}
+                title={isStreamingHere ? t('streams.stop') : t('streams.start')}
+                className={cn(
+                  'flex items-center justify-center w-10 h-10 rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50',
+                  isStreamingHere
+                    ? 'bg-red-500/20 text-red-400 hover:bg-red-500/30'
+                    : 'bg-muted hover:bg-accent text-muted-foreground hover:text-foreground',
+                )}
+              >
+                {isStartingStream ? <Loader2 className="w-5 h-5 animate-spin" /> : <Monitor className="w-5 h-5" />}
+              </button>
+              <button
+                onClick={leaveVoice}
+                title={t('voicePanel.disconnect')}
+                className="flex items-center justify-center w-10 h-10 rounded-full bg-muted hover:bg-destructive/20 text-muted-foreground hover:text-destructive transition-colors"
+              >
+                <PhoneOff className="w-5 h-5" />
+              </button>
+            </>
+          ) : (
+            <button
+              onClick={() => void handleJoinVoice()}
+              className="px-6 py-2 rounded-md bg-green-600 hover:bg-green-500 text-white text-sm font-medium transition-colors"
+            >
+              {t('channel.joinVoice')}
+            </button>
+          )}
+        </div>
+        <StartStreamDialog
+          open={streamDialogOpen}
+          isStarting={isStartingStream}
+          onOpenChange={setStreamDialogOpen}
+          onStart={handleStartChannelStream}
+        />
+      </div>
+    )
+  }
+
+  // Text channel view
+  return (
+    <>
+      <div className="flex flex-col flex-1 min-h-0">
+        <div
+          className={cn(
+            'border-b border-sidebar-border flex items-center gap-2 shrink-0 bg-background',
+            isMobile ? 'min-h-[60px] px-3 pt-[env(safe-area-inset-top)]' : 'h-12 px-4',
+          )}
+        >
+          {isMobile && (
+            <button
+              onClick={() => navigate(`/app/${serverId}`)}
+              className="w-11 h-11 flex items-center justify-center rounded-full text-muted-foreground hover:text-foreground active:bg-accent transition-colors shrink-0 -ml-1"
+              title="Back to channels"
+            >
+              <ChevronLeft className="w-5 h-5" />
+            </button>
+          )}
+          <Icon className="w-5 h-5 text-muted-foreground shrink-0" />
+          <span className="min-w-0 truncate font-semibold">{channel?.name ?? channelId}</span>
+          {!isMobile && channel?.topic && (
+            <>
+              <Separator orientation="vertical" className="h-5 mx-1" />
+              <span className="text-sm text-muted-foreground truncate">{channel.topic}</span>
+            </>
+          )}
+
+          {/* Mobile top-right icon buttons */}
+          {isMobile && (
+            <div className="ml-auto flex items-center gap-1">
+              {isTextChannel && (
+                <button
+                  onClick={() => {
+                    const opening = !mobileSearchOpen
+                    setMobileSearchOpen(opening)
+                    if (opening) {
+                      setTimeout(() => searchBarRef.current?.focus(), 50)
+                    } else {
+                      clearSearch()
+                    }
+                  }}
+                  title="Search"
+                  className={cn(
+                    'flex h-12 w-12 items-center justify-center rounded-full transition-colors',
+                    mobileSearchOpen || hasSearched
+                      ? 'text-foreground bg-accent'
+                      : 'text-muted-foreground hover:text-foreground hover:bg-accent/50',
+                  )}
+                >
+                  <Search className="w-4 h-4" />
+                </button>
+              )}
+              {isTextChannel && (
+                <Tooltip delayDuration={400}>
+                  <TooltipTrigger asChild>
+                    <button
+                      onClick={handleThreadButtonClick}
+                      className={cn(
+                        'flex h-12 w-12 items-center justify-center rounded-full transition-colors',
+                        threadButtonActive
+                          ? 'text-foreground bg-accent'
+                          : 'text-muted-foreground hover:text-foreground hover:bg-accent/50',
+                      )}
+                    >
+                      <Spool className="w-4 h-4" />
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent side="bottom">{threadButtonActive ? t('threads.hideThreadList') : t('threads.showThreadList')}</TooltipContent>
+                </Tooltip>
+              )}
+              <Tooltip delayDuration={400}>
+                <TooltipTrigger asChild>
+                  <button
+                    onClick={handleMembersButtonClick}
+                    className={cn(
+                        'flex h-12 w-12 items-center justify-center rounded-full transition-colors',
+                      rightPanelMode === 'members'
+                        ? 'text-foreground bg-accent'
+                        : 'text-muted-foreground hover:text-foreground hover:bg-accent/50',
+                    )}
+                  >
+                    <Users className="w-4 h-4" />
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom">{rightPanelMode === 'members' ? t('channel.hideMemberList') : t('channel.showMemberList')}</TooltipContent>
+              </Tooltip>
+            </div>
+          )}
+
+          {/* Desktop top-right controls */}
+          {!isMobile && (
+            <div className="ml-auto flex items-center gap-2">
+              {isTextChannel && (
+                <Tooltip delayDuration={400}>
+                  <TooltipTrigger asChild>
+                    <button
+                      onClick={handleThreadButtonClick}
+                      className={cn(
+                        'w-8 h-8 flex items-center justify-center rounded transition-colors',
+                        threadButtonActive
+                          ? 'text-foreground bg-accent'
+                          : 'text-muted-foreground hover:text-foreground hover:bg-accent/50',
+                      )}
+                    >
+                      <Spool className="w-4 h-4" />
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent side="bottom">{threadButtonActive ? t('threads.hideThreadList') : t('threads.showThreadList')}</TooltipContent>
+                </Tooltip>
+              )}
+              <Tooltip delayDuration={400}>
+                <TooltipTrigger asChild>
+                  <button
+                    onClick={handleMembersButtonClick}
+                    className={cn(
+                      'w-8 h-8 flex items-center justify-center rounded transition-colors',
+                      rightPanelMode === 'members'
+                        ? 'text-foreground bg-accent'
+                        : 'text-muted-foreground hover:text-foreground hover:bg-accent/50',
+                    )}
+                  >
+                    <Users className="w-4 h-4" />
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom">{rightPanelMode === 'members' ? t('channel.hideMemberList') : t('channel.showMemberList')}</TooltipContent>
+              </Tooltip>
+              <SearchBar
+                ref={searchBarRef}
+                className="w-60 focus-within:w-80 transition-[width] duration-200 h-7 rounded-md border border-input bg-muted/30 px-2"
+                members={members}
+                channels={channels}
+                onSearch={(params) => void doSearch(params, 0)}
+                onClear={clearSearch}
+                hasResults={hasSearched}
+              />
+            </div>
+          )}
+        </div>
+
+        {/* Mobile search bar — shown below header when search icon is active */}
+        {isMobile && mobileSearchOpen && (
+          <div className="border-b border-sidebar-border bg-background px-3 py-2 shrink-0">
+            <SearchBar
+              ref={searchBarRef}
+              className="w-full h-8 rounded-md border border-input bg-muted/30 px-2"
+              members={members}
+              channels={channels}
+              onSearch={(params) => void doSearch(params, 0)}
+              onClear={() => { clearSearch(); setMobileSearchOpen(false) }}
+              hasResults={hasSearched}
+            />
+          </div>
+        )}
+
+        <div ref={contentContainerRef} className="relative flex flex-1 min-h-0 overflow-hidden">
+          <ChatAttachmentDropZone
+            className="flex-1 min-w-0"
+            onFileDrop={(files) => {
+              messageInputRef.current?.addFiles(files)
+              messageInputRef.current?.focusEditor()
+            }}
+          >
+            <MessageList
+              key={channelId}
+              rows={rows}
+              mode={mode}
+              isLoadingInitial={isLoadingInitial}
+              jumpTargetRowKey={jumpTargetRowKey}
+              focusTargetRowKey={focusTargetRowKey}
+              highlightRequest={effectiveJumpRequest}
+              onHighlightHandled={handleChannelJumpHandled}
+              channelName={channel?.name}
+              resolver={mentionResolver}
+              getMessageProps={getParentMessageProps}
+              onLoadGap={loadGap}
+              onJumpToPresent={jumpToPresent}
+              onAckLatest={ackLatest}
+            />
+            <TypingIndicator channelId={channelId} serverId={serverId ?? ''} />
+            <MessageInput
+              ref={messageInputRef}
+              channelId={channelId}
+              channelName={channel?.name ? `#${channel.name}` : channelId}
+              resolver={mentionResolver}
+              replyTo={replyTarget}
+              onCancelReply={() => setReplyTarget(null)}
+            />
+          </ChatAttachmentDropZone>
+
+          <AnimatePresence>
+          {(hasSearched || rightPanelMode !== 'none') && serverId && (
+            <>
+              {!isMobile && isThreadSidePanelVisible && (
+                <div
+                  className="group relative w-1.5 shrink-0 cursor-col-resize bg-transparent touch-none"
+                  onPointerDown={handleRightPanelResizeStart}
+                >
+                  <div className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-sidebar-border/80 transition-colors group-hover:bg-foreground/30" />
+                </div>
+              )}
+              <motion.div
+                key="right-panel"
+                initial={{ opacity: 0, x: 32 }}
+                animate={{ opacity: 1, x: 0 }}
+                exit={{ opacity: 0, x: 32 }}
+                transition={{ type: 'spring', damping: 26, stiffness: 320 }}
+                className={cn(
+                  'flex min-h-0 flex-col overflow-hidden border-l border-sidebar-border bg-sidebar shrink-0',
+                  isMobile
+                    ? 'absolute inset-0 z-40'
+                    : hasSearched
+                      ? 'w-80'
+                      : isThreadSidePanelVisible
+                        ? ''
+                        : 'w-60',
+                )}
+                style={!isMobile && isThreadSidePanelVisible ? { width: `${activeRightPanelWidth}px` } : undefined}
+              >
+                {isMobile && (
+                  <div className="h-11 flex items-center px-4 border-b border-sidebar-border shrink-0">
+                    <span className="text-sm font-semibold flex-1">
+                      {hasSearched
+                        ? t('channel.searchResults')
+                        : rightPanelMode === 'members'
+                          ? t('channel.membersPanel')
+                          : t('threads.title')}
+                    </span>
+                    <button
+                      onClick={() => {
+                        if (hasSearched) { clearSearch(); setMobileSearchOpen(false) }
+                        else setRightPanelMode('none')
+                      }}
+                      className="w-7 h-7 flex items-center justify-center rounded text-muted-foreground hover:text-foreground hover:bg-accent/50 transition-colors"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  </div>
+                )}
+                {hasSearched ? (
+                  <SearchPanel
+                    serverId={serverId}
+                    results={searchResults}
+                    channels={channels}
+                    isLoading={isSearching}
+                    hasSearched={hasSearched}
+                    page={searchPage}
+                    totalPages={searchTotalPages}
+                    onPageChange={goToPage}
+                    onJumpToMessage={handleSearchJump}
+                    resolver={mentionResolver}
+                    className="flex-1 min-h-0"
+                    isMobile={isMobile}
+                  />
+                ) : rightPanelMode === 'thread' && activeThread ? (
+                  <ThreadPanel
+                    serverId={serverId}
+                    thread={activeThread}
+                    canManageThread={canManageActiveThread}
+                    canSendMessages={canSendInThreads}
+                    highlightRequest={threadJumpRequest}
+                    onHighlightHandled={handleThreadJumpHandled}
+                    resolver={mentionResolver}
+                    onOpenReferencedMessage={(targetChannelId, messageId) => {
+                      void openMessageLocation(targetChannelId, messageId)
+                    }}
+                    onBack={() => setRightPanelMode('threads')}
+                    onDeleted={() => {
+                      setActiveThreadId(null)
+                      setThreadJumpRequest(null)
+                      setRightPanelMode('threads')
+                    }}
+                  />
+                ) : rightPanelMode === 'thread-create' && createThreadSource ? (
+                  <ThreadCreatePanel
+                    parentChannelId={channelId}
+                    sourceMessage={createThreadSource}
+                    onBack={() => {
+                      setCreateThreadSource(null)
+                      setRightPanelMode('threads')
+                    }}
+                    onCreateThread={handleCreateThread}
+                  />
+                ) : rightPanelMode === 'thread' ? (
+                  <div className="flex flex-1 min-h-0 items-center justify-center text-sm text-muted-foreground">
+                    {t('common.loading')}
+                  </div>
+                ) : rightPanelMode === 'threads' ? (
+                <ThreadListPanel
+                  threads={channelThreads}
+                  previews={threadPreviewMap}
+                  previewMessages={threadPreviewMessageMap}
+                  memberColors={memberColorMap}
+                  isLoading={isThreadsLoading}
+                  activeThreadId={activeThreadId}
+                  resolver={mentionResolver}
+                  onOpenThread={(threadId) => openThread(threadId)}
+                />
+                ) : (
+                  <MemberList serverId={serverId} channel={channel} />
+                )}
+              </motion.div>
+            </>
+          )}
+          </AnimatePresence>
+        </div>
+      </div>
+    </>
+  )
+}
+
+/**
+ * Attaches a MediaStream to a <video> element.
+ */
+function getRenderableVideoTrack(stream: MediaStream | null | undefined): MediaStreamTrack | null {
+  return stream?.getVideoTracks().find((track) => track.readyState === 'live') ?? null
+}
+
+function clearVideoElement(el: HTMLVideoElement) {
+  el.pause()
+  el.srcObject = null
+  el.removeAttribute('src')
+  el.load()
+}
+
+function VideoFeed({
+  stream,
+  mirror = false,
+  muted = true,
+  volume = 1,
+  fit = 'cover',
+  onAspect,
+  onFrozen,
+  onActive,
+}: {
+  stream: MediaStream
+  mirror?: boolean
+  muted?: boolean
+  volume?: number
+  fit?: 'cover' | 'contain'
+  onAspect?: (ratio: number) => void
+  onFrozen?: () => void
+  onActive?: () => void
+}) {
+  const videoRef = useRef<HTMLVideoElement>(null)
+
+  useEffect(() => {
+    const el = videoRef.current
+    if (!el) return
+
+    const boundTracks = new Set<MediaStreamTrack>()
+    const clearStaleFrame = () => clearVideoElement(el)
+    const bindVideoTracks = () => {
+      for (const track of stream.getVideoTracks()) {
+        if (boundTracks.has(track)) continue
+        boundTracks.add(track)
+        track.addEventListener('ended', clearStaleFrame)
+        track.addEventListener('mute', clearStaleFrame)
+        track.addEventListener('unmute', attachStream)
+      }
+    }
+    const attachStream = () => {
+      bindVideoTracks()
+      if (!getRenderableVideoTrack(stream)) {
+        clearVideoElement(el)
+        return
+      }
+      if (el.srcObject !== stream) {
+        el.srcObject = stream
+      }
+      el.play().catch(() => {})
+    }
+
+    attachStream()
+
+    stream.addEventListener('addtrack', attachStream)
+    stream.addEventListener('removetrack', attachStream)
+
+    return () => {
+      for (const track of boundTracks) {
+        track.removeEventListener('ended', clearStaleFrame)
+        track.removeEventListener('mute', clearStaleFrame)
+        track.removeEventListener('unmute', attachStream)
+      }
+      stream.removeEventListener('addtrack', attachStream)
+      stream.removeEventListener('removetrack', attachStream)
+      clearVideoElement(el)
+    }
+  }, [stream])
+
+  useEffect(() => {
+    const el = videoRef.current
+    if (!el) return
+    el.muted = muted
+    el.volume = Math.max(0, Math.min(1, volume))
+  }, [muted, volume])
+
+  useEffect(() => {
+    if (!onFrozen && !onActive) return
+    const el = videoRef.current
+    if (!el) return
+
+    let lastFrames = -1
+    let staleCount = 0
+    const STALE_LIMIT = 6
+
+    const check = () => {
+      const q = el.getVideoPlaybackQuality?.()
+      if (!q) return
+      const frames = q.totalVideoFrames
+      if (frames === lastFrames) {
+        staleCount++
+        if (staleCount === STALE_LIMIT) onFrozen?.()
+      } else {
+        if (staleCount >= STALE_LIMIT) onActive?.()
+        staleCount = 0
+        lastFrames = frames
+      }
+    }
+
+    const timer = setInterval(check, 1000)
+    return () => clearInterval(timer)
+  }, [stream, onFrozen, onActive])
+
+  return (
+    <video
+      ref={videoRef}
+      autoPlay
+      playsInline
+      onLoadedMetadata={(e) => {
+        const { videoWidth: w, videoHeight: h } = e.currentTarget
+        if (w && h) onAspect?.(w / h)
+      }}
+      className={cn(
+        'w-full h-full rounded-lg',
+        fit === 'contain' ? 'object-contain' : 'object-cover',
+        mirror && '[transform:scaleX(-1)]',
+      )}
+    />
+  )
+}
+
+function formatDebugBitrate(value: number | null | undefined): string {
+  if (value == null) return '--'
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(2)} Mbps`
+  if (value >= 1_000) return `${Math.round(value / 1_000)} kbps`
+  return `${Math.round(value)} bps`
+}
+
+function formatDebugNumber(value: number | null | undefined, suffix = ''): string {
+  if (value == null) return '--'
+  return `${Math.round(value)}${suffix}`
+}
+
+function formatDebugCodec(value: string | null | undefined): string {
+  return value ?? '--'
+}
+
+function StreamDebugOverlay({ stats }: { stats: StreamDebugStats | null }) {
+  const video = stats?.video
+  const audio = stats?.audio
+  const resolution = video?.frameWidth && video.frameHeight
+    ? `${Math.round(video.frameWidth)}x${Math.round(video.frameHeight)}`
+    : '--'
+
+  return (
+    <div className="pointer-events-none absolute left-2 top-10 z-10 min-w-[190px] max-w-[260px] rounded-lg border border-cyan-300/25 bg-black/75 px-2.5 py-2 font-mono text-[10px] leading-relaxed text-cyan-50 shadow-xl backdrop-blur">
+      <div className="mb-1 flex items-center justify-between gap-3 border-b border-cyan-200/20 pb-1 text-[9px] font-semibold uppercase tracking-[0.16em] text-cyan-200">
+        <span>Stream Stats</span>
+        <span>{stats?.connectionState ?? 'waiting'}</span>
+      </div>
+      <div className="grid grid-cols-[auto_1fr] gap-x-2">
+        <span className="text-cyan-200/75">Video</span>
+        <span>{formatDebugCodec(video?.codec)}</span>
+        <span className="text-cyan-200/75">Size</span>
+        <span>{resolution}</span>
+        <span className="text-cyan-200/75">FPS</span>
+        <span>{formatDebugNumber(video?.framesPerSecond)}</span>
+        <span className="text-cyan-200/75">V Bitrate</span>
+        <span>{formatDebugBitrate(video?.bitrateBps)}</span>
+        <span className="text-cyan-200/75">Frames</span>
+        <span>{formatDebugNumber(video?.framesDecoded)} decoded / {formatDebugNumber(video?.framesDropped)} dropped</span>
+        <span className="text-cyan-200/75">Audio</span>
+        <span>{formatDebugCodec(audio?.codec)}</span>
+        <span className="text-cyan-200/75">A Bitrate</span>
+        <span>{formatDebugBitrate(audio?.bitrateBps)}</span>
+        <span className="text-cyan-200/75">Loss</span>
+        <span>v {formatDebugNumber(video?.packetsLost)} / a {formatDebugNumber(audio?.packetsLost)}</span>
+        <span className="text-cyan-200/75">Jitter</span>
+        <span>v {formatDebugNumber(video?.jitterMs, 'ms')} / a {formatDebugNumber(audio?.jitterMs, 'ms')}</span>
+        <span className="text-cyan-200/75">RTT</span>
+        <span>{formatDebugNumber(stats?.currentRoundTripTimeMs, 'ms')}</span>
+        <span className="text-cyan-200/75">Avail In</span>
+        <span>{formatDebugBitrate(stats?.availableIncomingBitrateBps)}</span>
+      </div>
+    </div>
+  )
+}
+
+type ParticipantSize = 'normal' | 'compact' | 'spotlight'
+
+type ParticipantStreamSummary = Pick<VoiceStreamSummary, 'id' | 'ownerUserId' | 'audioMode'>
+
+interface VoiceParticipantItem {
+  id: string
+  label: string
+  avatarUrl?: string
+  speaking: boolean
+  muted: boolean
+  deafened?: boolean
+  videoStream?: MediaStream | null
+  isLocal?: boolean
+  mirrorVideo?: boolean
+  streamSummary?: ParticipantStreamSummary | null
+  streamConnectionState?: StreamConnectionState | null
+  streamError?: string | null
+  isWatchingStream?: boolean
+  videoMuted?: boolean
+  videoVolume?: number
+  isStreamTile?: boolean
+}
+
+function VoiceParticipant({
+  label,
+  avatarUrl,
+  speaking,
+  muted,
+  deafened,
+  videoStream,
+  isLocal,
+  mirrorVideo,
+  streamSummary,
+  streamConnectionState,
+  streamError,
+  isWatchingStream,
+  isStreamTile,
+  videoMuted,
+  videoVolume,
+  size = 'normal',
+  onClick,
+  onWatchStream,
+  onStopWatching,
+  onReconnectStream,
+}: {
+  label: string
+  avatarUrl?: string
+  speaking: boolean
+  muted: boolean
+  deafened?: boolean
+  videoStream?: MediaStream | null
+  isLocal?: boolean
+  mirrorVideo?: boolean
+  streamSummary?: ParticipantStreamSummary | null
+  streamConnectionState?: StreamConnectionState | null
+  streamError?: string | null
+  isWatchingStream?: boolean
+  isStreamTile?: boolean
+  videoMuted?: boolean
+  videoVolume?: number
+  size?: ParticipantSize
+  onClick?: () => void
+  onWatchStream?: () => void
+  onStopWatching?: () => void
+  onReconnectStream?: () => void
+}) {
+  const { t } = useTranslation()
+  const initials = label.charAt(0).toUpperCase()
+  const streamId = videoStream?.id ?? null
+  const videoTrack = getRenderableVideoTrack(videoStream)
+  const videoTrackId = videoTrack?.id ?? null
+  const videoFeedKey = streamId && videoTrackId ? `${streamId}:${videoTrackId}` : null
+  const activeStreamId = streamSummary?.id ?? null
+  const streamControlsEnabled = !!isStreamTile
+  const streamHasAudio = streamControlsEnabled && !!activeStreamId && isWatchingStream && streamSummary?.audioMode !== 'none'
+  const currentVolume = Math.max(0, Math.min(100, Math.round((videoVolume ?? 1) * 100)))
+  const streamAudioMuted = !!videoMuted
+  const [streamAudioMenu, setStreamAudioMenu] = useState<{ x: number; y: number } | null>(null)
+  const [streamDebugEnabled, setStreamDebugEnabled] = useState(() => activeStreamId ? isStreamDebugOverlayEnabled(activeStreamId) : false)
+  const [streamDebugStats, setStreamDebugStats] = useState<StreamDebugStats | null>(null)
+  const [videoStalled, setVideoStalled] = useState(false)
+  const handleFrozen = useCallback(() => setVideoStalled(true), [])
+  const handleActive = useCallback(() => setVideoStalled(false), [])
+  const hasVideo = !!videoStream && !!videoTrack
+  const shouldMirrorVideo = mirrorVideo ?? isLocal
+  const hasActiveStream = !!streamSummary
+  const isStreamConnecting = streamControlsEnabled && hasActiveStream && isWatchingStream && !hasVideo && (streamConnectionState === 'connecting' || streamConnectionState === 'reconnecting')
+  const isStreamErrored = streamControlsEnabled && hasActiveStream && isWatchingStream && !hasVideo && streamConnectionState === 'error'
+
+  useEffect(() => {
+    setVideoStalled(false)
+  }, [streamId, videoTrackId, activeStreamId])
+
+  useEffect(() => {
+    setStreamDebugEnabled(activeStreamId ? isStreamDebugOverlayEnabled(activeStreamId) : false)
+    setStreamDebugStats(null)
+  }, [activeStreamId])
+
+  useEffect(() => {
+    const handleDebugOverlayChange = () => {
+      setStreamDebugEnabled(activeStreamId ? isStreamDebugOverlayEnabled(activeStreamId) : false)
+    }
+
+    window.addEventListener(STREAM_DEBUG_OVERLAY_EVENT, handleDebugOverlayChange)
+    return () => window.removeEventListener(STREAM_DEBUG_OVERLAY_EVENT, handleDebugOverlayChange)
+  }, [activeStreamId])
+
+  useEffect(() => {
+    if (!streamControlsEnabled || !streamDebugEnabled || !activeStreamId || !isWatchingStream || !hasVideo) {
+      setStreamDebugStats(null)
+      return
+    }
+
+    let cancelled = false
+    const refresh = () => {
+      void getStreamDebugStats(activeStreamId)
+        .then((stats) => {
+          if (!cancelled) setStreamDebugStats(stats)
+        })
+        .catch(() => {
+          if (!cancelled) setStreamDebugStats(null)
+        })
+    }
+
+    refresh()
+    const timer = window.setInterval(refresh, 1_000)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [activeStreamId, hasVideo, isWatchingStream, streamControlsEnabled, streamDebugEnabled])
+
+  useEffect(() => {
+    if (!streamAudioMenu) return
+
+    const closeMenu = () => setStreamAudioMenu(null)
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') closeMenu()
+    }
+
+    window.addEventListener('click', closeMenu)
+    window.addEventListener('keydown', handleKeyDown)
+    return () => {
+      window.removeEventListener('click', closeMenu)
+      window.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [streamAudioMenu])
+
+  function handleStreamContextMenu(event: MouseEvent<HTMLDivElement>) {
+    if (!streamControlsEnabled || !activeStreamId || !isWatchingStream) return
+    event.preventDefault()
+    event.stopPropagation()
+
+    const menuWidth = 188
+    const menuHeight = streamHasAudio ? 112 : 52
+    const x = Math.max(8, Math.min(event.clientX, window.innerWidth - menuWidth - 8))
+    const y = Math.max(8, Math.min(event.clientY, window.innerHeight - menuHeight - 8))
+    setStreamAudioMenu({ x, y })
+  }
+
+  function handleToggleWatchedStreamAudio(event?: MouseEvent<HTMLButtonElement>) {
+    event?.stopPropagation()
+    if (!activeStreamId || !streamHasAudio) return
+    useStreamStore.getState().setWatchedMuted(activeStreamId, !streamAudioMuted)
+  }
+
+  function handleWatchedStreamVolumeChange(event: ChangeEvent<HTMLInputElement>) {
+    event.stopPropagation()
+    if (!activeStreamId || !streamHasAudio) return
+    const nextVolume = Number(event.currentTarget.value)
+    useStreamStore.getState().setWatchedVolume(activeStreamId, nextVolume)
+    if (nextVolume > 0 && streamAudioMuted) {
+      useStreamStore.getState().setWatchedMuted(activeStreamId, false)
+    }
+  }
+
+  const avatarCls = size === 'spotlight' ? 'w-24 h-24' : size === 'compact' ? 'w-12 h-12' : 'w-20 h-20'
+  const fallbackCls = size === 'spotlight' ? 'text-3xl' : size === 'compact' ? 'text-base' : 'text-xl'
+  const badgeCls = size === 'spotlight' ? 'w-7 h-7' : 'w-5 h-5'
+  const badgeIconCls = size === 'spotlight' ? 'w-4 h-4' : 'w-3 h-3'
+  const labelCls = size === 'compact' ? 'text-[10px] max-w-[80px]' : 'text-xs max-w-[100px]'
+
+  return (
+    <div className={cn(
+      'flex flex-col items-center gap-2',
+      size === 'spotlight' && hasVideo && 'h-full w-full min-w-0',
+    )}>
+      {/*
+        Outer wrapper has NO overflow-hidden — speaking ring and mute/deafen badges
+        are positioned here and must render outside the avatar's clipping boundary.
+      */}
+      <div
+        className={cn(
+          'relative transition-all duration-150',
+          size === 'spotlight' && hasVideo && 'h-full w-full min-w-0',
+          hasVideo && onClick && 'cursor-pointer',
+        )}
+        onClick={onClick}
+      >
+        {hasVideo ? (
+          /* Video: overflow-hidden is scoped to the video container, not the wrapper */
+          <div className={cn(
+            'rounded-lg bg-zinc-900 overflow-hidden relative',
+            size === 'spotlight' ? 'w-full h-full max-w-full max-h-full' : size === 'compact' ? 'w-36 h-24' : 'w-56 h-40',
+          )}
+          onContextMenu={handleStreamContextMenu}
+          >
+            <VideoFeed
+              key={videoFeedKey ?? videoStream!.id}
+              stream={videoStream!}
+              mirror={shouldMirrorVideo}
+              muted={videoMuted}
+              volume={videoVolume}
+              fit={size === 'spotlight' ? 'contain' : 'cover'}
+              onFrozen={isLocal ? undefined : handleFrozen}
+              onActive={isLocal ? undefined : handleActive}
+            />
+            {hasActiveStream && (
+              <div className="absolute left-2 top-2 rounded-full bg-red-500/90 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-white shadow-sm">
+                {t('streams.liveBadge')}
+              </div>
+            )}
+            {streamControlsEnabled && streamDebugEnabled && activeStreamId && isWatchingStream && (
+              <StreamDebugOverlay stats={streamDebugStats} />
+            )}
+            {streamControlsEnabled && videoStalled && hasActiveStream && isWatchingStream && (
+              <div className="absolute bottom-9 left-2 z-10 inline-flex items-center gap-1.5 rounded-full border border-amber-300/30 bg-amber-950/75 px-2 py-1 text-[10px] font-medium text-amber-100 shadow-sm backdrop-blur">
+                <Loader2 className="h-3 w-3 animate-spin" />
+                {t('streams.videoStalled')}
+              </div>
+            )}
+            {hasActiveStream && !isWatchingStream && onWatchStream && (
+              <button
+                type="button"
+                onClick={(event) => {
+                  event.stopPropagation()
+                  onWatchStream()
+                }}
+                className="absolute right-2 top-2 inline-flex items-center gap-1 rounded-full bg-background/90 px-2 py-1 text-[10px] font-medium text-foreground shadow-sm transition-colors hover:bg-background"
+              >
+                <Monitor className="h-3 w-3" />
+                {t('streams.watch')}
+              </button>
+            )}
+            {hasActiveStream && isWatchingStream && onStopWatching && (
+              <button
+                type="button"
+                onClick={(event) => {
+                  event.stopPropagation()
+                  onStopWatching()
+                }}
+                className="absolute right-2 top-2 inline-flex items-center gap-1 rounded-full bg-background/90 px-2 py-1 text-[10px] font-medium text-foreground shadow-sm transition-colors hover:bg-background"
+              >
+                <X className="h-3 w-3" />
+                {t('streams.stopWatching')}
+              </button>
+            )}
+            {streamAudioMenu && (
+              <div
+                className="fixed z-50 w-[188px] rounded-lg border border-border/70 bg-popover/95 p-2 text-popover-foreground shadow-xl backdrop-blur"
+                style={{ left: streamAudioMenu.x, top: streamAudioMenu.y }}
+                onClick={(event) => event.stopPropagation()}
+                onPointerDown={(event) => event.stopPropagation()}
+              >
+                {streamHasAudio ? (
+                  <div className="space-y-2">
+                    <button
+                      type="button"
+                      onClick={handleToggleWatchedStreamAudio}
+                      className="flex w-full items-center justify-between rounded-md px-2 py-1.5 text-xs font-medium transition-colors hover:bg-accent"
+                    >
+                      <span>{streamAudioMuted ? t('streams.unmuteAudio') : t('streams.muteAudio')}</span>
+                      {streamAudioMuted ? <VolumeX className="h-3.5 w-3.5" /> : <Volume2 className="h-3.5 w-3.5" />}
+                    </button>
+                    <label className="block px-2">
+                      <span className="mb-1 flex items-center justify-between text-[10px] font-medium uppercase tracking-[0.12em] text-muted-foreground">
+                        <span>{t('streams.volume')}</span>
+                        <span>{currentVolume}%</span>
+                      </span>
+                      <input
+                        type="range"
+                        min={0}
+                        max={100}
+                        step={1}
+                        value={currentVolume}
+                        onChange={handleWatchedStreamVolumeChange}
+                        className="h-1.5 w-full accent-primary"
+                      />
+                    </label>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-2 px-2 py-1.5 text-xs text-muted-foreground">
+                    <VolumeX className="h-3.5 w-3.5" />
+                    <span>{t('streams.noStreamAudio')}</span>
+                  </div>
+                )}
+              </div>
+            )}
+            {/* Label + icon bar inside the video */}
+            <div className="absolute bottom-0 left-0 right-0 px-2 py-1 bg-black/50 flex items-center justify-between gap-1">
+              <span className="text-xs text-white truncate">{label}</span>
+              <div className="flex items-center gap-1 shrink-0">
+                {deafened
+                  ? <HeadphoneOff className="w-3 h-3 text-destructive" />
+                  : muted
+                    ? <MicOff className="w-3 h-3 text-destructive" />
+                    : null}
+              </div>
+            </div>
+            {/* Speaking ring inside video */}
+            {speaking && (
+              <div className="absolute inset-0 ring-2 ring-green-500 rounded-lg pointer-events-none" />
+            )}
+          </div>
+        ) : (
+          /* Avatar: Avatar has its own overflow-hidden; ring and badge sit on the wrapper */
+          <>
+            <Avatar className={cn(avatarCls, 'transition-all duration-150')}>
+              {avatarUrl && <AvatarImage src={avatarUrl} alt={label} className="object-cover" />}
+              <AvatarFallback className={fallbackCls}>{initials}</AvatarFallback>
+            </Avatar>
+            {/* Speaking ring — sibling of Avatar, not clipped by it */}
+            {speaking && (
+              <div className="absolute inset-0 rounded-full ring-2 ring-green-500 ring-offset-2 ring-offset-background pointer-events-none" />
+            )}
+            {/* Mute/Deafen badge — sibling of Avatar, not clipped by it */}
+            {(deafened || muted) && (
+              <div className={cn(
+                'absolute -bottom-1 -right-1 rounded-full bg-destructive border border-background flex items-center justify-center pointer-events-none',
+                badgeCls,
+              )}>
+                {deafened
+                  ? <HeadphoneOff className={cn(badgeIconCls, 'text-white')} />
+                  : <MicOff className={cn(badgeIconCls, 'text-white')} />
+                }
+              </div>
+            )}
+          </>
+        )}
+      </div>
+      {!hasVideo && (
+        <div className="flex flex-col items-center gap-1">
+          <span className={cn('text-muted-foreground truncate', labelCls)}>{label}</span>
+          {hasActiveStream && !isWatchingStream && onWatchStream && (
+            <button
+              type="button"
+              onClick={onWatchStream}
+              className="inline-flex items-center gap-1 rounded-full border border-red-500/30 bg-red-500/10 px-2 py-1 text-[10px] font-medium text-red-400 transition-colors hover:bg-red-500/15"
+            >
+              <Monitor className="h-3 w-3" />
+              {t('streams.clickToWatch')}
+            </button>
+          )}
+          {isStreamConnecting && (
+            <span className="inline-flex items-center gap-1 rounded-full border border-border/60 bg-muted/70 px-2 py-1 text-[10px] font-medium text-muted-foreground">
+              <Loader2 className="h-3 w-3 animate-spin" />
+              {t('streams.connecting')}
+            </span>
+          )}
+          {isStreamErrored && onReconnectStream && (
+            <button
+              type="button"
+              onClick={onReconnectStream}
+              className="inline-flex items-center gap-1 rounded-full border border-border/60 bg-muted/70 px-2 py-1 text-[10px] font-medium text-foreground transition-colors hover:bg-accent"
+              title={streamError ?? undefined}
+            >
+              <RotateCcw className="h-3 w-3" />
+              {t('streams.reconnect')}
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
